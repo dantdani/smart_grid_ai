@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Smart Grid AI — Operator Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #111831;
+      --panel-2: #0f1530;
+      --border: #24304f;
+      --text: #e8ecf8;
+      --muted: #8a97b8;
+      --accent: #4ea1ff;
+      --ok: #3ddb84;
+      --warn: #ffb547;
+      --bad: #ff5a5a;
+      --rl: #4ea1ff;
+      --opf: #ffb547;
+      --fallback: #ff5a5a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+                 font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif; }
+    header { padding: 14px 22px; border-bottom: 1px solid var(--border);
+             display: flex; align-items: center; justify-content: space-between; background: #0a0f22; }
+    header h1 { margin: 0; font-size: 18px; letter-spacing: 0.3px; }
+    header .tag { font-size: 12px; color: var(--muted); margin-left: 10px; }
+    .layout { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; padding: 16px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+    .panel h2 { margin: 0 0 10px 0; font-size: 14px; color: var(--muted);
+                text-transform: uppercase; letter-spacing: 1px; }
+    .kpis { display: flex; gap: 10px; flex-wrap: wrap; }
+    .kpi { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+           padding: 8px 12px; min-width: 110px; }
+    .kpi .label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+    .kpi .value { font-size: 18px; font-weight: 600; }
+    .row-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+    button { background: var(--accent); color: #fff; border: 0; padding: 8px 14px;
+             border-radius: 6px; cursor: pointer; font-weight: 600; }
+    button.secondary { background: #2a3659; }
+    button.danger { background: #b03a3a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input[type="text"] { flex: 1; min-width: 280px; background: #0a0f22; color: var(--text);
+                         border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+    svg text { fill: var(--text); font-family: inherit; }
+    .log { max-height: 340px; overflow-y: auto; font-family: "Consolas", monospace; font-size: 12px; }
+    .log-entry { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    .log-entry .src { display: inline-block; padding: 1px 6px; border-radius: 3px;
+                      font-size: 10px; margin-right: 6px; font-weight: 700; }
+    .src.rl { background: rgba(78,161,255,.2); color: var(--rl); }
+    .src.opf { background: rgba(255,181,71,.2); color: var(--opf); }
+    .src.fallback { background: rgba(255,90,90,.2); color: var(--fallback); }
+    .src.op { background: rgba(61,219,132,.2); color: var(--ok); }
+    .wsdot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .wsdot.on { background: var(--ok); } .wsdot.off { background: var(--bad); }
+    .chart-wrap { height: 200px; }
+    .tiny { font-size: 11px; color: var(--muted); }
+  </style>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/prop-types@15/prop-types.min.js" crossorigin></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js" crossorigin></script>
+  <script src="https://unpkg.com/d3@7/dist/d3.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Smart Grid AI
+        <span class="tag">hybrid RL + physics-OPF + LLM operator</span>
+      </h1>
+    </div>
+    <div id="status" class="tiny"></div>
+  </header>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useEffect, useRef, useState, useCallback } = React;
+    const {
+      LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer,
+      BarChart, Bar, CartesianGrid, ReferenceLine
+    } = Recharts;
+
+    const API = "http://127.0.0.1:8000";
+
+    // ------------------------------- helpers
+    const voltageColor = (v, vmin, vmax) => {
+      if (v == null || Number.isNaN(v)) return "#666";
+      if (v < vmin) return "#ff5a5a";
+      if (v > vmax) return "#ff5a5a";
+      const margin = 0.02;
+      if (v < vmin + margin || v > vmax - margin) return "#ffb547";
+      return "#3ddb84";
+    };
+
+    async function fetchJSON(path, opts) {
+      const r = await fetch(API + path, opts);
+      if (!r.ok) throw new Error(path + " " + r.status);
+      return r.json();
+    }
+
+    // ------------------------------- Network diagram (D3 SVG)
+    function NetworkMap({ state }) {
+      const ref = useRef(null);
+
+      useEffect(() => {
+        if (!state || !ref.current) return;
+        const svg = d3.select(ref.current);
+        svg.selectAll("*").remove();
+
+        const W = ref.current.clientWidth || 640;
+        const H = 260;
+        svg.attr("viewBox", `0 0 ${W} ${H}`);
+
+        const houses = state.house_ids || [];
+        const derSet = new Set(state.der_house_ids || []);
+        const n = houses.length;
+        const marginX = 60;
+        const spacing = (W - 2 * marginX) / (n);
+        const yBus = 140;
+
+        // feeder line
+        svg.append("line")
+          .attr("x1", marginX - 30).attr("y1", yBus)
+          .attr("x2", marginX + spacing * n).attr("y2", yBus)
+          .attr("stroke", "#2a3659").attr("stroke-width", 3);
+
+        // slack / substation
+        svg.append("rect")
+          .attr("x", marginX - 56).attr("y", yBus - 22)
+          .attr("width", 46).attr("height", 44).attr("rx", 6)
+          .attr("fill", "#1b2547").attr("stroke", "#4ea1ff");
+        svg.append("text").attr("x", marginX - 33).attr("y", yBus + 5)
+          .attr("text-anchor", "middle").attr("font-size", 11).text("MV");
+
+        houses.forEach((id, i) => {
+          const cx = marginX + spacing * (i + 0.5);
+          const v = state.voltages_pu[i];
+          const color = voltageColor(v, state.v_min, state.v_max);
+          const isDER = derSet.has(id);
+
+          // drop to house
+          svg.append("line")
+            .attr("x1", cx).attr("y1", yBus)
+            .attr("x2", cx).attr("y2", yBus - 46)
+            .attr("stroke", "#2a3659").attr("stroke-width", 2);
+
+          // house box
+          const hw = 38, hh = 34;
+          svg.append("rect")
+            .attr("x", cx - hw / 2).attr("y", yBus - 46 - hh)
+            .attr("width", hw).attr("height", hh).attr("rx", 4)
+            .attr("fill", "#111831").attr("stroke", color).attr("stroke-width", 2);
+
+          // house id
+          svg.append("text").attr("x", cx).attr("y", yBus - 46 - hh + 13)
+            .attr("text-anchor", "middle").attr("font-size", 11)
+            .attr("fill", color).text("H" + id);
+
+          // voltage label
+          svg.append("text").attr("x", cx).attr("y", yBus - 46 - hh + 27)
+            .attr("text-anchor", "middle").attr("font-size", 10)
+            .attr("fill", color).text(v != null ? v.toFixed(3) : "—");
+
+          // DER marker (sun) below bus
+          if (isDER) {
+            svg.append("circle")
+              .attr("cx", cx).attr("cy", yBus + 24).attr("r", 10)
+              .attr("fill", "#ffd166").attr("opacity", 0.85);
+            svg.append("text").attr("x", cx).attr("y", yBus + 28)
+              .attr("text-anchor", "middle").attr("font-size", 12).attr("fill", "#111").text("☼");
+          }
+        });
+
+        // legend
+        svg.append("text").attr("x", W - 180).attr("y", 22).attr("font-size", 12)
+          .attr("fill", "#8a97b8").text(`safe band: [${state.v_min}, ${state.v_max}] p.u.`);
+      }, [state]);
+
+      return <svg ref={ref} style={{ width: "100%", height: 260 }} />;
+    }
+
+    // ------------------------------- Telemetry charts
+    function Telemetry({ history }) {
+      const vData = history.map(h => ({
+        t: h.hour,
+        vmin: Math.min(...h.voltages_pu),
+        vmax: Math.max(...h.voltages_pu),
+      }));
+      const pData = history.map(h => {
+        const avail = (h.available_solar_kw || []).reduce((a, b) => a + b, 0);
+        const curt = (h.curtailed_kw || []).reduce((a, b) => a + b, 0);
+        return { t: h.hour, avail, delivered: Math.max(0, avail - curt), curt };
+      });
+
+      return (
+        <div>
+          <div className="tiny" style={{marginBottom:6}}>Bus voltage envelope (min / max per step)</div>
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <LineChart data={vData} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+                <CartesianGrid stroke="#24304f" strokeDasharray="3 3" />
+                <XAxis dataKey="t" stroke="#8a97b8" tick={{ fontSize: 11 }} />
+                <YAxis domain={[0.93, 1.07]} stroke="#8a97b8" tick={{ fontSize: 11 }} />
+                <Tooltip contentStyle={{ background: "#0f1530", border: "1px solid #24304f" }} />
+                <ReferenceLine y={0.95} stroke="#ff5a5a" strokeDasharray="4 4" />
+                <ReferenceLine y={1.05} stroke="#ff5a5a" strokeDasharray="4 4" />
+                <Line type="monotone" dataKey="vmin" stroke="#4ea1ff" dot={false} isAnimationActive={false}/>
+                <Line type="monotone" dataKey="vmax" stroke="#ffb547" dot={false} isAnimationActive={false}/>
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="tiny" style={{margin:"10px 0 6px 0"}}>Solar availability vs delivered after curtailment (kW)</div>
+          <div className="chart-wrap">
+            <ResponsiveContainer>
+              <BarChart data={pData} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+                <CartesianGrid stroke="#24304f" strokeDasharray="3 3" />
+                <XAxis dataKey="t" stroke="#8a97b8" tick={{ fontSize: 11 }} />
+                <YAxis stroke="#8a97b8" tick={{ fontSize: 11 }} />
+                <Tooltip contentStyle={{ background: "#0f1530", border: "1px solid #24304f" }} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Bar dataKey="delivered" stackId="a" fill="#3ddb84" />
+                <Bar dataKey="curt" stackId="a" fill="#ff5a5a" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      );
+    }
+
+    // ------------------------------- Decision log
+    function DecisionLog({ items }) {
+      return (
+        <div className="log">
+          {items.slice().reverse().map((e, i) => {
+            if (e.kind === "operator_command") {
+              return (
+                <div className="log-entry" key={i}>
+                  <span className="src op">OP</span>
+                  "{e.command}" → <code>{JSON.stringify(e.applied)}</code>
+                </div>
+              );
+            }
+            const src = e.decision?.source || "rl";
+            const hour = (e.hour ?? 0).toFixed(1);
+            const reward = (e.reward ?? 0).toFixed(2);
+            const viol = e.violated ? " ⚠ violation" : "";
+            return (
+              <div className="log-entry" key={i}>
+                <span className={"src " + src}>{src.toUpperCase()}</span>
+                hr {hour} · r={reward}{viol} · curt=[
+                {(e.decision?.applied_curtailment || []).map(x => x.toFixed(2)).join(", ")}]
+              </div>
+            );
+          })}
+          {items.length === 0 && <div className="tiny" style={{padding:8}}>(no events yet)</div>}
+        </div>
+      );
+    }
+
+    // ------------------------------- App
+    function App() {
+      const [state, setState] = useState(null);
+      const [log, setLog] = useState([]);
+      const [history, setHistory] = useState([]);
+      const [running, setRunning] = useState(false);
+      const [command, setCommand] = useState("A storm is coming and solar will drop by 70%");
+      const [wsOk, setWsOk] = useState(false);
+      const [err, setErr] = useState(null);
+
+      // initial load
+      useEffect(() => {
+        fetchJSON("/grid_state").then(setState).catch(e => setErr(String(e)));
+        fetchJSON("/action_log?limit=50").then(r => setLog(r.items || []));
+      }, []);
+
+      // websocket
+      useEffect(() => {
+        const ws = new WebSocket(API.replace("http", "ws") + "/ws");
+        ws.onopen = () => setWsOk(true);
+        ws.onclose = () => setWsOk(false);
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.grid_state) setState(msg.grid_state);
+            if (msg.type === "step" && msg.payload) {
+              setLog(l => [...l, msg.payload].slice(-200));
+              setHistory(h => [...h, msg.payload].slice(-60));
+            }
+            if (msg.type === "operator_command" && msg.payload) {
+              setLog(l => [...l, msg.payload].slice(-200));
+            }
+          } catch (e) {}
+        };
+        return () => ws.close();
+      }, []);
+
+      const doStep = useCallback(async () => {
+        try {
+          await fetchJSON("/step", { method: "POST" });
+        } catch (e) { setErr(String(e)); }
+      }, []);
+
+      // auto-run loop
+      useEffect(() => {
+        if (!running) return;
+        const id = setInterval(doStep, 1100);
+        return () => clearInterval(id);
+      }, [running, doStep]);
+
+      const submitCommand = async () => {
+        if (!command.trim()) return;
+        try {
+          await fetchJSON("/operator_command", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command }),
+          });
+        } catch (e) { setErr(String(e)); }
+      };
+
+      const doReset = async () => {
+        try {
+          await fetchJSON("/reset", { method: "POST" });
+          setHistory([]); setLog([]);
+        } catch (e) { setErr(String(e)); }
+      };
+
+      const statusEl = document.getElementById("status");
+      if (statusEl) {
+        statusEl.innerHTML =
+          `<span class="wsdot ${wsOk ? "on" : "off"}"></span>` +
+          (wsOk ? "live" : "disconnected") +
+          (err ? ` · <span style="color:#ff5a5a">${err}</span>` : "");
+      }
+
+      if (!state) return <div style={{padding:20}} className="tiny">connecting to backend…</div>;
+
+      const viols = state.violations.filter(Boolean).length;
+      const vmin = Math.min(...state.voltages_pu).toFixed(3);
+      const vmax = Math.max(...state.voltages_pu).toFixed(3);
+      const avail = (state.available_solar_kw || []).reduce((a,b)=>a+b,0).toFixed(1);
+      const load = (state.loads_kw || []).reduce((a,b)=>a+b,0).toFixed(1);
+
+      return (
+        <div className="layout">
+          <div>
+            <div className="panel" style={{marginBottom:16}}>
+              <h2>Radial Feeder</h2>
+              <div className="kpis" style={{marginBottom:10}}>
+                <div className="kpi"><div className="label">hour</div><div className="value">{state.hour.toFixed(1)}</div></div>
+                <div className="kpi"><div className="label">v_min</div><div className="value" style={{color:voltageColor(+vmin,state.v_min,state.v_max)}}>{vmin}</div></div>
+                <div className="kpi"><div className="label">v_max</div><div className="value" style={{color:voltageColor(+vmax,state.v_min,state.v_max)}}>{vmax}</div></div>
+                <div className="kpi"><div className="label">violations</div><div className="value" style={{color: viols?"#ff5a5a":"#3ddb84"}}>{viols}</div></div>
+                <div className="kpi"><div className="label">avail PV</div><div className="value">{avail} kW</div></div>
+                <div className="kpi"><div className="label">total load</div><div className="value">{load} kW</div></div>
+                <div className="kpi"><div className="label">solar_scale</div><div className="value">{state.solar_scale.toFixed(2)}</div></div>
+              </div>
+              <NetworkMap state={state} />
+            </div>
+
+            <div className="panel">
+              <h2>Telemetry</h2>
+              <Telemetry history={history} />
+            </div>
+          </div>
+
+          <div>
+            <div className="panel" style={{marginBottom:16}}>
+              <h2>Operator Console</h2>
+              <div className="row-controls">
+                <input type="text" value={command} onChange={e => setCommand(e.target.value)}
+                       placeholder="e.g. prioritize stability, we have a heatwave" />
+                <button onClick={submitCommand}>Send</button>
+              </div>
+              <div className="row-controls">
+                <button onClick={doStep}>▶ Step</button>
+                <button className="secondary" onClick={() => setRunning(r => !r)}>
+                  {running ? "⏸ Pause" : "⏵ Auto-run"}
+                </button>
+                <button className="danger" onClick={doReset}>Reset</button>
+              </div>
+              <div className="tiny">
+                v_pen={state.reward_weights?.voltage_penalty_weight} · curt_w={state.reward_weights?.curtailment_weight} ·
+                stab_bonus={state.reward_weights?.stability_bonus}
+              </div>
+            </div>
+
+            <div className="panel">
+              <h2>Decision Log</h2>
+              <DecisionLog items={log} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

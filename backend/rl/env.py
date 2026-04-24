@@ -4,19 +4,24 @@ Phase 1b — Gymnasium wrapper around the pandapower feeder.
 Observation (26,) = [
     10 bus voltages (p.u.),
     10 household loads (kW),
-     5 available solar (kW, pre-curtailment),
+     5 available DER kW (mixed: 3 solar + 1 wind + 1 gas, pre-curtailment),
      1 time_of_day in [0, 1),
 ]
 
-Action (5,) in [0, 1]  — per-DER solar curtailment fraction.
-    0.0 => no curtailment (inject full available PV)
+Action (5,) in [0, 1] — per-DER curtailment fraction.
+    0.0 => no curtailment (inject full available power)
     1.0 => full curtailment (inject 0 kW)
 
-Reward:
-    * -100 per bus voltage outside [0.95, 1.05] p.u.  (voltage_penalty_weight
-      scales the -100 term)
-    *  -0.1 * total_curtailed_kW
-    *  +10 if every bus is within the safe band
+The action shape is preserved across all DER technologies, so a policy
+trained on the pure-solar version still loads cleanly. The user can also
+*pin* one or more DERs (`manual_overrides`) so the RL agent only optimises
+the remaining ones.
+
+Reward
+------
+* -100 * voltage_penalty_weight per bus voltage outside [V_MIN, V_MAX]
+* -curtailment_weight * total_curtailed_kW
+* +stability_bonus when every bus is in the safe band
 """
 from __future__ import annotations
 
@@ -29,36 +34,37 @@ import pandapower as pp
 from gymnasium import spaces
 
 from ..grid import (
+    DER_CAPACITY_KW,
     DER_HOUSES,
+    DER_TYPES,
+    NUM_DER,
     NUM_HOUSES,
     SOLAR_CAPACITY_KW,
     build_grid,
+    der_availability,
     load_profile,
+    set_der_kw,
     set_loads_kw,
-    set_solar_kw,
-    solar_profile,
 )
 
 V_MIN: float = 0.95
 V_MAX: float = 1.05
-NUM_DER: int = len(DER_HOUSES)
 OBS_DIM: int = NUM_HOUSES + NUM_HOUSES + NUM_DER + 1  # 26
 
-# Reward weights (can be overridden at reset by the LLM operator layer)
 DEFAULT_REWARD_WEIGHTS = {
-    "voltage_penalty_weight": 1.0,   # multiplies the -100 per-violation term
-    "curtailment_weight": 0.1,       # -w * total_curtailed_kW
-    "stability_bonus": 10.0,         # +bonus when all-in-band
+    "voltage_penalty_weight": 1.0,
+    "curtailment_weight": 0.1,
+    "stability_bonus": 10.0,
 }
 
 
 @dataclass
 class EnvConfig:
-    dt_hours: float = 1.0         # one step = 1 hour
-    episode_hours: float = 24.0   # one episode = one day
+    dt_hours: float = 1.0
+    episode_hours: float = 24.0
     start_hour: float = 0.0
-    solar_scale: float = 1.0      # LLM can shrink/grow available PV
-    load_scale: float = 1.0
+    solar_scale: float = 1.0      # multiplies solar DER availability only
+    load_scale: float = 1.0       # global load multiplier (per-house overrides on top)
     seed: int | None = None
 
 
@@ -70,17 +76,18 @@ class SmartGridEnv(gym.Env):
         self.cfg = config or EnvConfig()
         self.reward_weights = dict(DEFAULT_REWARD_WEIGHTS)
 
+        max_caps = np.asarray(DER_CAPACITY_KW, dtype=np.float32)
         self.observation_space = spaces.Box(
             low=np.concatenate([
-                np.full(NUM_HOUSES, 0.80, dtype=np.float32),           # voltages
-                np.full(NUM_HOUSES, 0.0, dtype=np.float32),            # loads
-                np.full(NUM_DER, 0.0, dtype=np.float32),               # solar
-                np.array([0.0], dtype=np.float32),                     # tod
+                np.full(NUM_HOUSES, 0.80, dtype=np.float32),
+                np.full(NUM_HOUSES, 0.0, dtype=np.float32),
+                np.zeros(NUM_DER, dtype=np.float32),
+                np.array([0.0], dtype=np.float32),
             ]),
             high=np.concatenate([
                 np.full(NUM_HOUSES, 1.20, dtype=np.float32),
-                np.full(NUM_HOUSES, 10.0, dtype=np.float32),
-                np.full(NUM_DER, float(SOLAR_CAPACITY_KW), dtype=np.float32),
+                np.full(NUM_HOUSES, 30.0, dtype=np.float32),
+                max_caps,
                 np.array([1.0], dtype=np.float32),
             ]),
             dtype=np.float32,
@@ -95,8 +102,18 @@ class SmartGridEnv(gym.Env):
         self._max_steps: int = int(round(self.cfg.episode_hours / self.cfg.dt_hours))
 
         self._last_loads_kw: np.ndarray = np.zeros(NUM_HOUSES, dtype=np.float32)
-        self._last_available_solar_kw: np.ndarray = np.zeros(NUM_DER, dtype=np.float32)
+        self._last_available_der_kw: np.ndarray = np.zeros(NUM_DER, dtype=np.float32)
         self._last_voltages: np.ndarray = np.ones(NUM_HOUSES, dtype=np.float32)
+
+        # Per-house multiplier (defaults to 1.0 each). Operator slider sets these.
+        self.house_load_scales: np.ndarray = np.ones(NUM_HOUSES, dtype=np.float32)
+        # NaN means "RL controls it"; finite value in [0,1] pins the DER's curtailment.
+        self.manual_overrides: np.ndarray = np.full(NUM_DER, np.nan, dtype=np.float32)
+
+    # Backward-compat alias (older code may still read this attribute name)
+    @property
+    def _last_available_solar_kw(self) -> np.ndarray:  # pragma: no cover - shim
+        return self._last_available_der_kw
 
     # ------------------------------------------------------------------
     # Gym API
@@ -113,10 +130,9 @@ class SmartGridEnv(gym.Env):
         self._hour = self.cfg.start_hour
         self._steps = 0
 
-        # Sample the first timestep with *zero curtailment* just to populate obs.
         self._sample_exogenous()
         set_loads_kw(self.handles, self._last_loads_kw.tolist())
-        set_solar_kw(self.handles, self._last_available_solar_kw.tolist())
+        set_der_kw(self.handles, self._last_available_der_kw.tolist())
         self._run_powerflow()
 
         return self._build_observation(), self._build_info(curtail=np.zeros(NUM_DER))
@@ -124,21 +140,16 @@ class SmartGridEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         action = np.asarray(action, dtype=np.float32).reshape(NUM_DER)
         action = np.clip(action, 0.0, 1.0)
+        action = self.apply_overrides(action)
 
-        # 1. Apply curtailment to current available solar
-        curtailed_kw = self._last_available_solar_kw * action
-        delivered_kw = self._last_available_solar_kw - curtailed_kw
+        curtailed_kw = self._last_available_der_kw * action
+        delivered_kw = self._last_available_der_kw - curtailed_kw
         set_loads_kw(self.handles, self._last_loads_kw.tolist())
-        set_solar_kw(self.handles, delivered_kw.tolist())
+        set_der_kw(self.handles, delivered_kw.tolist())
 
-        # 2. Power flow
         converged = self._run_powerflow()
-
-        # 3. Reward
         reward, violated = self._compute_reward(curtailed_kw, converged)
 
-        # 4. Advance time + sample next exogenous so observation reflects the
-        #    state the agent will see on the *next* call.
         self._steps += 1
         self._hour = (self._hour + self.cfg.dt_hours) % 24.0
         terminated = False
@@ -156,15 +167,54 @@ class SmartGridEnv(gym.Env):
         return obs, float(reward), terminated, truncated, info
 
     # ------------------------------------------------------------------
+    # Overrides / scales
+    # ------------------------------------------------------------------
+    def apply_overrides(self, action: np.ndarray) -> np.ndarray:
+        """Return action with manual overrides substituted for the locked DERs."""
+        out = np.asarray(action, dtype=np.float32).copy()
+        mask = ~np.isnan(self.manual_overrides)
+        if mask.any():
+            out[mask] = np.clip(self.manual_overrides[mask], 0.0, 1.0)
+        return out
+
+    def set_house_load_scale(self, house_id: int, scale: float) -> None:
+        if not (1 <= house_id <= NUM_HOUSES):
+            raise ValueError(f"house_id must be 1..{NUM_HOUSES}, got {house_id}")
+        self.house_load_scales[house_id - 1] = float(np.clip(scale, 0.0, 5.0))
+
+    def set_house_load_scales(self, scales) -> None:
+        arr = np.asarray(scales, dtype=np.float32).reshape(-1)
+        if arr.size != NUM_HOUSES:
+            raise ValueError(f"Expected {NUM_HOUSES} scales, got {arr.size}")
+        self.house_load_scales = np.clip(arr, 0.0, 5.0)
+
+    def set_der_override(self, der_index: int, curtailment: float | None) -> None:
+        if not (0 <= der_index < NUM_DER):
+            raise ValueError(f"der_index must be 0..{NUM_DER - 1}, got {der_index}")
+        if curtailment is None:
+            self.manual_overrides[der_index] = np.nan
+        else:
+            self.manual_overrides[der_index] = float(np.clip(curtailment, 0.0, 1.0))
+
+    def clear_der_overrides(self) -> None:
+        self.manual_overrides[:] = np.nan
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _sample_exogenous(self) -> None:
-        self._last_loads_kw = (
-            load_profile(self._hour, rng=self.rng) * self.cfg.load_scale
-        ).astype(np.float32)
-        self._last_available_solar_kw = (
-            solar_profile(self._hour, rng=self.rng) * self.cfg.solar_scale
-        ).astype(np.float32)
+        loads = load_profile(
+            self._hour,
+            rng=self.rng,
+            per_house_scale=self.house_load_scales.astype(float),
+        ) * self.cfg.load_scale
+        self._last_loads_kw = loads.astype(np.float32)
+
+        avail = der_availability(self._hour, rng=self.rng)
+        # solar_scale only applies to solar DERs (so "no solar at night" stays true)
+        solar_mask = np.array([t == "solar" for t in DER_TYPES])
+        avail[solar_mask] *= self.cfg.solar_scale
+        self._last_available_der_kw = avail.astype(np.float32)
 
     def _run_powerflow(self) -> bool:
         try:
@@ -173,7 +223,6 @@ class SmartGridEnv(gym.Env):
             self._last_voltages = v.astype(np.float32)
             return True
         except Exception:
-            # Diverged — keep last voltages, mark as violation in reward
             return False
 
     def _compute_reward(self, curtailed_kw: np.ndarray, converged: bool) -> tuple[float, bool]:
@@ -198,7 +247,7 @@ class SmartGridEnv(gym.Env):
         return np.concatenate([
             self._last_voltages,
             self._last_loads_kw,
-            self._last_available_solar_kw,
+            self._last_available_der_kw,
             tod,
         ]).astype(np.float32)
 
@@ -215,7 +264,9 @@ class SmartGridEnv(gym.Env):
             "step": int(self._steps),
             "voltages_pu": self._last_voltages.copy(),
             "loads_kw": self._last_loads_kw.copy(),
-            "available_solar_kw": self._last_available_solar_kw.copy(),
+            "available_solar_kw": self._last_available_der_kw.copy(),  # legacy key
+            "available_der_kw": self._last_available_der_kw.copy(),
+            "der_types": list(DER_TYPES),
             "curtail_action": curtail.copy(),
             "curtailed_kw": None if curtailed_kw is None else curtailed_kw.copy(),
             "delivered_kw": None if delivered_kw is None else delivered_kw.copy(),
@@ -223,7 +274,6 @@ class SmartGridEnv(gym.Env):
             "converged": bool(converged),
         }
 
-    # Convenience for verification / LLM layers later on.
     def set_reward_weights(self, **overrides: float) -> None:
         for k, v in overrides.items():
             if k not in DEFAULT_REWARD_WEIGHTS:

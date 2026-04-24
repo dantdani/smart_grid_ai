@@ -166,13 +166,24 @@
             .attr("text-anchor", "middle").attr("font-size", 10)
             .attr("fill", color).text(v != null ? v.toFixed(3) : "—");
 
-          // DER marker (sun) below bus
+          // DER marker — icon depends on tech
           if (isDER) {
+            const derIdx = (state.der_house_ids || []).indexOf(id);
+            const tech = (state.der_types || [])[derIdx] || "solar";
+            const colorMap = { solar: "#ffd166", wind: "#7ad7ff", gas: "#ff8a5b" };
+            const iconMap = { solar: "☼", wind: "🌬", gas: "🔥" };
             svg.append("circle")
-              .attr("cx", cx).attr("cy", yBus + 24).attr("r", 10)
-              .attr("fill", "#ffd166").attr("opacity", 0.85);
+              .attr("cx", cx).attr("cy", yBus + 24).attr("r", 11)
+              .attr("fill", colorMap[tech] || "#ffd166").attr("opacity", 0.9);
             svg.append("text").attr("x", cx).attr("y", yBus + 28)
-              .attr("text-anchor", "middle").attr("font-size", 12).attr("fill", "#111").text("☼");
+              .attr("text-anchor", "middle").attr("font-size", 12).attr("fill", "#111")
+              .text(iconMap[tech] || "☼");
+            const overrides = state.manual_overrides || [];
+            if (overrides[derIdx] != null) {
+              svg.append("circle")
+                .attr("cx", cx + 11).attr("cy", yBus + 16).attr("r", 4)
+                .attr("fill", "#3ddb84").attr("stroke", "#0b1020");
+            }
           }
         });
 
@@ -263,6 +274,85 @@
       );
     }
 
+    // ------------------------------- Household demand sliders
+    function HouseholdLoads({ state }) {
+      const ids = state.house_ids || [];
+      const scales = state.house_load_scales || ids.map(() => 1);
+      const loads = state.loads_kw || [];
+      const post = (i, scale) => fetchJSON("/set_house_load", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ house_id: ids[i], scale }),
+      }).catch(() => {});
+      return (
+        <div>
+          <div className="tiny" style={{marginBottom:6}}>Per-house demand multiplier (0×–3×). Drag to simulate a sudden spike.</div>
+          <div style={{display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:"6px 14px"}}>
+            {ids.map((id, i) => (
+              <div key={id} style={{display:"flex", alignItems:"center", gap:8, fontSize:12}}>
+                <span style={{width:30, color:"#8a97b8"}}>H{id}</span>
+                <input type="range" min="0" max="3" step="0.05"
+                       value={scales[i] ?? 1} style={{flex:1}}
+                       onChange={(e) => post(i, parseFloat(e.target.value))}/>
+                <span style={{width:42, textAlign:"right"}}>{(scales[i] ?? 1).toFixed(2)}×</span>
+                <span style={{width:54, textAlign:"right", color:"#8a97b8"}}>{(loads[i] ?? 0).toFixed(1)} kW</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ------------------------------- DER manual overrides
+    function DerControls({ state }) {
+      const types = state.der_types || [];
+      const caps = state.der_capacity_kw || [];
+      const houses = state.der_house_ids || [];
+      const overrides = state.manual_overrides || [];
+      const avail = state.available_der_kw || state.available_solar_kw || [];
+      const iconMap = { solar: "☼", wind: "🌬", gas: "🔥" };
+      const labelMap = { solar: "Solar", wind: "Wind", gas: "Gas" };
+      const post = (idx, curtailment) => fetchJSON("/set_der_override", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ der_index: idx, curtailment }),
+      }).catch(() => {});
+      const clearAll = () => fetchJSON("/clear_der_overrides", { method: "POST" }).catch(() => {});
+      return (
+        <div>
+          <div className="row-controls">
+            <button className="secondary" onClick={clearAll}>Auto-pilot all</button>
+            <span className="tiny">Pin a DER to a fixed curtailment; the RL agent optimizes the rest.</span>
+          </div>
+          <div style={{display:"flex", flexDirection:"column", gap:6}}>
+            {types.map((t, i) => {
+              const pinned = overrides[i] != null;
+              const cVal = pinned ? overrides[i] : 0.0;
+              return (
+                <div key={i} style={{display:"flex", alignItems:"center", gap:8, fontSize:12,
+                                     background:"#0f1530", border:"1px solid #24304f",
+                                     borderRadius:6, padding:"6px 8px"}}>
+                  <span style={{width:24, fontSize:16}}>{iconMap[t] || "?"}</span>
+                  <span style={{width:56}}>{labelMap[t] || t}</span>
+                  <span style={{width:32, color:"#8a97b8"}}>H{houses[i]}</span>
+                  <span style={{width:80, color:"#8a97b8"}}>{(avail[i] ?? 0).toFixed(1)} / {caps[i]} kW</span>
+                  <label style={{display:"flex", alignItems:"center", gap:4}}>
+                    <input type="checkbox" checked={pinned}
+                           onChange={(e) => post(i, e.target.checked ? 0.0 : null)} />
+                    Pin
+                  </label>
+                  <input type="range" min="0" max="1" step="0.01"
+                         disabled={!pinned} value={cVal} style={{flex:1, opacity: pinned?1:0.4}}
+                         onChange={(e) => post(i, parseFloat(e.target.value))}/>
+                  <span style={{width:54, textAlign:"right"}}>
+                    curt {(cVal * 100).toFixed(0)}%
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
     // ------------------------------- App
     function App() {
       const [state, setState] = useState(null);
@@ -343,7 +433,7 @@
       const viols = state.violations.filter(Boolean).length;
       const vmin = Math.min(...state.voltages_pu).toFixed(3);
       const vmax = Math.max(...state.voltages_pu).toFixed(3);
-      const avail = (state.available_solar_kw || []).reduce((a,b)=>a+b,0).toFixed(1);
+      const avail = (state.available_der_kw || state.available_solar_kw || []).reduce((a,b)=>a+b,0).toFixed(1);
       const load = (state.loads_kw || []).reduce((a,b)=>a+b,0).toFixed(1);
 
       return (
@@ -356,7 +446,7 @@
                 <div className="kpi"><div className="label">v_min</div><div className="value" style={{color:voltageColor(+vmin,state.v_min,state.v_max)}}>{vmin}</div></div>
                 <div className="kpi"><div className="label">v_max</div><div className="value" style={{color:voltageColor(+vmax,state.v_min,state.v_max)}}>{vmax}</div></div>
                 <div className="kpi"><div className="label">violations</div><div className="value" style={{color: viols?"#ff5a5a":"#3ddb84"}}>{viols}</div></div>
-                <div className="kpi"><div className="label">avail PV</div><div className="value">{avail} kW</div></div>
+                <div className="kpi"><div className="label">avail DER</div><div className="value">{avail} kW</div></div>
                 <div className="kpi"><div className="label">total load</div><div className="value">{load} kW</div></div>
                 <div className="kpi"><div className="label">solar_scale</div><div className="value">{state.solar_scale.toFixed(2)}</div></div>
               </div>
@@ -370,6 +460,16 @@
           </div>
 
           <div>
+            <div className="panel" style={{marginBottom:16}}>
+              <h2>Household Demand</h2>
+              <HouseholdLoads state={state} />
+            </div>
+
+            <div className="panel" style={{marginBottom:16}}>
+              <h2>DER Control</h2>
+              <DerControls state={state} />
+            </div>
+
             <div className="panel" style={{marginBottom:16}}>
               <h2>Operator Console</h2>
               <div className="row-controls">

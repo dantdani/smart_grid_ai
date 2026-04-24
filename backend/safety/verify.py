@@ -21,10 +21,17 @@ from typing import Literal
 import numpy as np
 import pandapower as pp
 
-from ..grid import DER_HOUSES, NUM_HOUSES, SOLAR_CAPACITY_KW, set_loads_kw, set_solar_kw
+from ..grid import (
+    DER_CAPACITY_KW,
+    DER_HOUSES,
+    NUM_HOUSES,
+    set_der_kw,
+    set_loads_kw,
+)
 from ..rl.env import V_MAX, V_MIN, SmartGridEnv
 
 NUM_DER = len(DER_HOUSES)
+_DER_CAP = np.asarray(DER_CAPACITY_KW, dtype=float)
 
 Source = Literal["rl", "opf", "fallback"]
 
@@ -48,7 +55,7 @@ def _simulate(net: pp.pandapowerNet, handles, loads_kw, available_kw, curtail) -
     """Apply (loads, solar * (1-curtail)) to *net* and run power flow. Returns (converged, house_voltages)."""
     delivered = np.asarray(available_kw, dtype=float) * (1.0 - np.asarray(curtail, dtype=float))
     set_loads_kw(handles, loads_kw)
-    set_solar_kw(handles, delivered.tolist())
+    set_der_kw(handles, delivered.tolist())
     try:
         pp.runpp(net, numba=False)
     except Exception:
@@ -69,27 +76,31 @@ def _clone_handles(env: SmartGridEnv):
     return clone
 
 
-def _run_opf(handles, loads_kw, available_kw) -> np.ndarray | None:
+def _run_opf(handles, loads_kw, available_kw, overrides: np.ndarray | None = None) -> np.ndarray | None:
     """
-    Use pandapower OPF to find the minimum-curtailment PV dispatch that keeps
+    Use pandapower OPF to find the minimum-curtailment dispatch that keeps
     all bus voltages in [V_MIN, V_MAX]. Returns per-DER curtailment in [0,1],
     or None if OPF fails.
 
-    Model:
-      - Cap each sgen's p_mw at its currently available PV (upper bound).
-      - Minimize cost = -p_mw (i.e. maximize delivered PV) on each sgen.
-      - Bus voltage box: [V_MIN, V_MAX].
+    If `overrides` is given (length NUM_DER, NaN = free, value = pinned
+    curtailment), the pinned DERs are forced via `min_p_mw == max_p_mw`.
     """
     net = handles.net
-    avail = np.clip(np.asarray(available_kw, dtype=float), 0.0, SOLAR_CAPACITY_KW)
+    avail = np.minimum(np.clip(np.asarray(available_kw, dtype=float), 0.0, None), _DER_CAP)
 
     set_loads_kw(handles, loads_kw)
-    # Upper-bound sgen injection at the currently available PV
     for i, sidx in enumerate(handles.sgen_indices):
-        net.sgen.at[sidx, "max_p_mw"] = float(avail[i]) * 1e-3
-        net.sgen.at[sidx, "min_p_mw"] = 0.0
+        a = float(avail[i])
         net.sgen.at[sidx, "controllable"] = True
-        net.sgen.at[sidx, "p_mw"] = float(avail[i]) * 1e-3
+        if overrides is not None and not np.isnan(overrides[i]):
+            forced = a * (1.0 - float(np.clip(overrides[i], 0.0, 1.0)))
+            net.sgen.at[sidx, "min_p_mw"] = forced * 1e-3
+            net.sgen.at[sidx, "max_p_mw"] = forced * 1e-3
+            net.sgen.at[sidx, "p_mw"] = forced * 1e-3
+        else:
+            net.sgen.at[sidx, "max_p_mw"] = a * 1e-3
+            net.sgen.at[sidx, "min_p_mw"] = 0.0
+            net.sgen.at[sidx, "p_mw"] = a * 1e-3
 
     # Voltage box constraints on every bus
     net.bus["min_vm_pu"] = V_MIN
@@ -125,10 +136,21 @@ def verify_action(
     env: SmartGridEnv,
     rl_action: np.ndarray,
 ) -> VerificationResult:
-    """Return the action that should actually be applied + decision metadata."""
-    rl = np.clip(np.asarray(rl_action, dtype=float), 0.0, 1.0)
+    """Return the action that should actually be applied + decision metadata.
+
+    Honours `env.manual_overrides`: any DER pinned by the operator is forced
+    in both the RL probe and the OPF leg, so safety analysis reflects the
+    dispatch the user will actually see.
+    """
+    rl_raw = np.clip(np.asarray(rl_action, dtype=float), 0.0, 1.0)
+    overrides = np.asarray(env.manual_overrides, dtype=float)
+    rl = rl_raw.copy()
+    mask = ~np.isnan(overrides)
+    if mask.any():
+        rl[mask] = np.clip(overrides[mask], 0.0, 1.0)
+
     loads_kw = env._last_loads_kw.tolist()
-    available_kw = env._last_available_solar_kw.tolist()
+    available_kw = env._last_available_der_kw.tolist()
 
     # 1. Probe the RL action on a cloned net
     probe = _clone_handles(env)
@@ -147,11 +169,15 @@ def verify_action(
             message="RL action verified safe.",
         )
 
-    # 2. RL unsafe -> run OPF on a fresh clone
+    # 2. RL unsafe -> run OPF on a fresh clone (with overrides honoured)
     opf_clone = _clone_handles(env)
-    opf_curtail = _run_opf(opf_clone, loads_kw, available_kw)
+    opf_curtail = _run_opf(opf_clone, loads_kw, available_kw, overrides=overrides)
 
     if opf_curtail is not None:
+        # Force pinned DERs to their override regardless of OPF rounding
+        if mask.any():
+            opf_curtail = opf_curtail.copy()
+            opf_curtail[mask] = np.clip(overrides[mask], 0.0, 1.0)
         check = _clone_handles(env)
         ok_opf, v_opf = _simulate(check.net, check, loads_kw, available_kw, opf_curtail)
         if ok_opf and not _any_violation(v_opf):
@@ -166,8 +192,11 @@ def verify_action(
                 message="RL action unsafe; OPF override applied.",
             )
 
-    # 3. Last-resort fallback: full curtailment
+    # 3. Last-resort fallback: maximally curtail (but still honour overrides)
     fb = np.ones(NUM_DER)
+    if mask.any():
+        fb = fb.copy()
+        fb[mask] = np.clip(overrides[mask], 0.0, 1.0)
     check = _clone_handles(env)
     _, v_fb = _simulate(check.net, check, loads_kw, available_kw, fb)
     return VerificationResult(

@@ -23,7 +23,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from ..grid import DER_HOUSES, NUM_HOUSES
+from ..grid import DER_HOUSES, DER_TYPES, DER_CAPACITY_KW, NUM_DER, NUM_HOUSES
 from ..llm import parse_operator_command
 from ..rl.env import EnvConfig, SmartGridEnv, V_MAX, V_MIN
 from ..safety import verify_action
@@ -98,14 +98,23 @@ app.add_middleware(
 def _grid_state_payload() -> dict[str, Any]:
     env = state.env
     v = env._last_voltages
+    overrides = [
+        None if (x != x) else float(x)  # NaN check
+        for x in env.manual_overrides.tolist()
+    ]
     return {
         "hour": float(env._hour),
         "step": int(env._steps),
         "voltages_pu": [float(x) for x in v],
         "loads_kw": [float(x) for x in env._last_loads_kw],
-        "available_solar_kw": [float(x) for x in env._last_available_solar_kw],
-        "house_ids": list(range(1, NUM_HOUSES + 1)),
+        "available_solar_kw": [float(x) for x in env._last_available_der_kw],  # legacy
+        "available_der_kw": [float(x) for x in env._last_available_der_kw],
+        "der_types": list(DER_TYPES),
+        "der_capacity_kw": list(DER_CAPACITY_KW),
         "der_house_ids": list(DER_HOUSES),
+        "manual_overrides": overrides,
+        "house_load_scales": [float(x) for x in env.house_load_scales],
+        "house_ids": list(range(1, NUM_HOUSES + 1)),
         "v_min": V_MIN,
         "v_max": V_MAX,
         "violations": [bool(x < V_MIN or x > V_MAX) for x in v],
@@ -133,6 +142,20 @@ async def _broadcast(payload: dict[str, Any]) -> None:
 # ----------------------------------------------------------------------
 class OperatorCommand(BaseModel):
     command: str
+
+
+class HouseLoadScale(BaseModel):
+    house_id: int
+    scale: float
+
+
+class HouseLoadScales(BaseModel):
+    scales: list[float]
+
+
+class DerOverride(BaseModel):
+    der_index: int
+    curtailment: float | None = None  # None clears override
 
 
 class StepResponse(BaseModel):
@@ -228,6 +251,71 @@ async def post_reset() -> dict[str, Any]:
     state.obs, _ = state.env.reset(seed=0)
     state.action_log.clear()
     await _broadcast({"type": "reset", "grid_state": _grid_state_payload()})
+    return _grid_state_payload()
+
+
+@app.post("/set_house_load")
+async def post_set_house_load(body: HouseLoadScale) -> dict[str, Any]:
+    state.env.set_house_load_scale(body.house_id, body.scale)
+    entry = {
+        "kind": "operator_command",
+        "command": f"house {body.house_id} load x{body.scale:.2f}",
+        "parsed": {"house_id": body.house_id, "scale": float(body.scale)},
+        "applied": {"house_load_scales": [float(x) for x in state.env.house_load_scales]},
+    }
+    state.action_log.append(entry)
+    await _broadcast({"type": "operator_command", "payload": entry,
+                      "grid_state": _grid_state_payload()})
+    return _grid_state_payload()
+
+
+@app.post("/set_house_loads")
+async def post_set_house_loads(body: HouseLoadScales) -> dict[str, Any]:
+    state.env.set_house_load_scales(body.scales)
+    entry = {
+        "kind": "operator_command",
+        "command": "bulk house-load update",
+        "parsed": {"scales": [float(x) for x in state.env.house_load_scales]},
+        "applied": {"house_load_scales": [float(x) for x in state.env.house_load_scales]},
+    }
+    state.action_log.append(entry)
+    await _broadcast({"type": "operator_command", "payload": entry,
+                      "grid_state": _grid_state_payload()})
+    return _grid_state_payload()
+
+
+@app.post("/set_der_override")
+async def post_set_der_override(body: DerOverride) -> dict[str, Any]:
+    state.env.set_der_override(body.der_index, body.curtailment)
+    overrides = [None if (x != x) else float(x) for x in state.env.manual_overrides.tolist()]
+    entry = {
+        "kind": "operator_command",
+        "command": (
+            f"clear DER {body.der_index} override"
+            if body.curtailment is None
+            else f"pin DER {body.der_index} curtailment to {body.curtailment:.2f}"
+        ),
+        "parsed": {"der_index": body.der_index, "curtailment": body.curtailment},
+        "applied": {"manual_overrides": overrides},
+    }
+    state.action_log.append(entry)
+    await _broadcast({"type": "operator_command", "payload": entry,
+                      "grid_state": _grid_state_payload()})
+    return _grid_state_payload()
+
+
+@app.post("/clear_der_overrides")
+async def post_clear_der_overrides() -> dict[str, Any]:
+    state.env.clear_der_overrides()
+    entry = {
+        "kind": "operator_command",
+        "command": "clear all DER overrides",
+        "parsed": {},
+        "applied": {"manual_overrides": [None] * NUM_DER},
+    }
+    state.action_log.append(entry)
+    await _broadcast({"type": "operator_command", "payload": entry,
+                      "grid_state": _grid_state_payload()})
     return _grid_state_payload()
 
 

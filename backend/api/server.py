@@ -270,6 +270,12 @@ async def post_operator_command(cmd: OperatorCommand) -> dict[str, Any]:
     if "solar_scale" in parsed:
         env.set_scales(solar_scale=parsed["solar_scale"])
         applied["solar_scale"] = env.cfg.solar_scale
+    if "wind_scale" in parsed:
+        env.set_scales(wind_scale=parsed["wind_scale"])
+        applied["wind_scale"] = env.cfg.wind_scale
+    if "gas_scale" in parsed:
+        env.set_scales(gas_scale=parsed["gas_scale"])
+        applied["gas_scale"] = env.cfg.gas_scale
     if "load_scale" in parsed:
         env.set_scales(load_scale=parsed["load_scale"])
         applied["load_scale"] = env.cfg.load_scale

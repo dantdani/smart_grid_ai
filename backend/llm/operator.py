@@ -24,6 +24,8 @@ from typing import Any
 
 SCHEMA_KEYS = {
     "solar_scale",
+    "wind_scale",
+    "gas_scale",
     "load_scale",
     "voltage_penalty_weight",
     "curtailment_weight",
@@ -39,11 +41,15 @@ You MUST return a single JSON object with TWO top-level fields:
 
 1. "decision": an object containing a subset of these keys (omit keys that the
    command does not mention):
-     - solar_scale            (float 0..2): multiplier on available solar PV.
+     - solar_scale            (float 0..2): multiplier on the 3 solar DERs' availability.
                               "solar drops 70%" -> 0.3; "solar doubles" -> 2.0.
+     - wind_scale             (float 0..2): multiplier on the 1 wind DER's availability.
+                              "strong winds" / "windy" -> 1.5..2.0; "calm winds" -> 0.3..0.7.
+     - gas_scale              (float 0..2): multiplier on the 1 gas DER's dispatchable cap.
+                              "gas plant offline" -> 0; "reserve more gas" -> 1.5.
      - load_scale             (float 0..2): multiplier on residential load.
      - voltage_penalty_weight (float, typical 0.5..5): higher = prioritize voltage safety.
-     - curtailment_weight     (float, typical 0.01..1): higher = preserve more PV.
+     - curtailment_weight     (float, typical 0.01..1): higher = preserve more PV/wind.
      - stability_bonus        (float, typical 1..20): reward when all voltages are safe.
      - note                   (string): brief echo of the operator intent.
 
@@ -73,6 +79,11 @@ Output:
 {"decision": {"load_scale": 1.5, "note": "Heatwave: +50% load."},
  "reasoning": "A 50% load surge across 10 houses risks under-voltage at the feeder tail; load_scale=1.5 simulates this so the RL/OPF stack can react. Reward weights are kept at defaults so the agent's normal trade-offs apply."}
 
+Input: "Strong winds are expected from the east."
+Output:
+{"decision": {"wind_scale": 1.8, "note": "Strong winds: wind DER boosted."},
+ "reasoning": "Strong winds raise the wind turbine's available output, so wind_scale=1.8 boosts the single wind DER. Solar, gas, and reward weights are unchanged because the operator only flagged a wind event."}
+
 Output JSON only, no prose, no code fences."""
 
 
@@ -95,6 +106,24 @@ def _regex_fallback(command: str) -> dict[str, Any]:
         out["solar_scale"] = 2.0
     if ("no solar" in cmd) or ("solar off" in cmd):
         out["solar_scale"] = 0.0
+
+    # Wind scaling
+    if re.search(r"\b(strong|high|gust\w*|heavy)\b.*\bwind", cmd) or re.search(r"\bwind\w*\b.*\b(strong|pick\w* up|increas\w*|gust\w*)\b", cmd):
+        out["wind_scale"] = 1.8
+    elif re.search(r"\b(calm|light|low|no|drop\w*|weak)\b.*\bwind", cmd) or re.search(r"\bwind\w*\b.*\b(calm|drop\w*|die\w*|weak)\b", cmd):
+        out["wind_scale"] = 0.3
+    m = re.search(r"wind.*?(?:drop|reduce|fall|decrease).*?(\d+)\s*(?:%|percent)", cmd)
+    if m:
+        out["wind_scale"] = max(0.0, 1.0 - int(m.group(1)) / 100.0)
+    m = re.search(r"wind.*?(?:increase|rise|boost|grow).*?(\d+)\s*(?:%|percent)", cmd)
+    if m:
+        out["wind_scale"] = min(2.0, 1.0 + int(m.group(1)) / 100.0)
+
+    # Gas scaling
+    if re.search(r"\bgas\b.*\b(off|offline|down|trip\w*|outage)\b", cmd):
+        out["gas_scale"] = 0.0
+    elif re.search(r"\b(reserve|boost|more)\b.*\bgas\b", cmd) or re.search(r"\bgas\b.*\b(boost\w*|reserve\w*|increase\w*)\b", cmd):
+        out["gas_scale"] = 1.5
 
     # Load scaling
     m = re.search(r"(?:load|demand|usage|households?).*?(?:increase|more).*?(\d+)\s*(?:%|percent)", cmd)
@@ -183,10 +212,9 @@ def _clean(parsed: dict[str, Any]) -> dict[str, Any]:
             except (TypeError, ValueError):
                 continue
     # Clamp to reasonable ranges
-    if "solar_scale" in out:
-        out["solar_scale"] = max(0.0, min(2.0, out["solar_scale"]))
-    if "load_scale" in out:
-        out["load_scale"] = max(0.0, min(2.0, out["load_scale"]))
+    for k in ("solar_scale", "wind_scale", "gas_scale", "load_scale"):
+        if k in out:
+            out[k] = max(0.0, min(2.0, out[k]))
     for w in ("voltage_penalty_weight", "curtailment_weight", "stability_bonus"):
         if w in out:
             out[w] = max(0.0, out[w])

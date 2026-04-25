@@ -27,9 +27,11 @@
              display: flex; align-items: center; justify-content: space-between; background: #0a0f22; }
     header h1 { margin: 0; font-size: 18px; letter-spacing: 0.3px; }
     header .tag { font-size: 12px; color: var(--muted); margin-left: 10px; }
-    .layout { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; padding: 16px; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+              gap: 16px; padding: 16px; max-width: 1600px; margin: 0 auto; }
+    .row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+             padding: 14px; min-width: 0; overflow: hidden; }
     .panel h2 { margin: 0 0 10px 0; font-size: 14px; color: var(--muted);
                 text-transform: uppercase; letter-spacing: 1px; }
     .kpis { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -43,10 +45,12 @@
     button.secondary { background: #2a3659; }
     button.danger { background: #b03a3a; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    input[type="text"] { flex: 1; min-width: 280px; background: #0a0f22; color: var(--text);
+    input[type="text"] { flex: 1 1 200px; min-width: 0; background: #0a0f22; color: var(--text);
                          border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
     svg text { fill: var(--text); font-family: inherit; }
-    .log { max-height: 340px; overflow-y: auto; font-family: "Consolas", monospace; font-size: 12px; }
+    .log { max-height: 340px; overflow-y: auto; overflow-x: hidden;
+           font-family: "Consolas", monospace; font-size: 12px;
+           word-break: break-word; }
     .log-entry { padding: 6px 8px; border-bottom: 1px solid var(--border); }
     .log-entry .src { display: inline-block; padding: 1px 6px; border-radius: 3px;
                       font-size: 10px; margin-right: 6px; font-weight: 700; }

@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from ..grid import DER_HOUSES, DER_TYPES, DER_CAPACITY_KW, NUM_DER, NUM_HOUSES
-from ..llm import parse_operator_command
+from ..llm import parse_operator_command, predict_event, apply_to_env
 from ..rl.env import EnvConfig, SmartGridEnv, V_MAX, V_MIN
 from ..safety import verify_action
 
@@ -144,6 +144,11 @@ class OperatorCommand(BaseModel):
     command: str
 
 
+class EventDescription(BaseModel):
+    event_description: str
+    apply: bool = True  # if False, only return the prediction without modifying env
+
+
 class HouseLoadScale(BaseModel):
     house_id: int
     scale: float
@@ -241,6 +246,33 @@ async def post_operator_command(cmd: OperatorCommand) -> dict[str, Any]:
     await _broadcast({"type": "operator_command", "payload": entry,
                       "grid_state": _grid_state_payload()})
     return entry
+
+
+@app.post("/predict_event")
+async def post_predict_event(body: EventDescription) -> dict[str, Any]:
+    """LLM Situational Awareness: turn an event description into validated
+    grid parameters (and optionally apply them to the live simulation).
+
+    Response includes event_type plus any of solar_scale, wind_scale,
+    gas_scale, load_multiplier, voltage_penalty_weight,
+    curtailment_penalty_weight (each clamped to its allowed range), plus an
+    `applied` field showing which env knobs were actually changed.
+    """
+    prediction = predict_event(body.event_description)
+    applied: dict[str, Any] = {}
+    if body.apply and prediction.get("event_type") != "none":
+        applied = apply_to_env(state.env, prediction)
+
+    entry = {
+        "kind": "predict_event",
+        "event_description": body.event_description,
+        "prediction": prediction,
+        "applied": applied,
+    }
+    state.action_log.append(entry)
+    await _broadcast({"type": "predict_event", "payload": entry,
+                      "grid_state": _grid_state_payload()})
+    return {**prediction, "applied": applied}
 
 
 @app.get("/action_log")

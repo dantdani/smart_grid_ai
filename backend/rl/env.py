@@ -64,6 +64,8 @@ class EnvConfig:
     episode_hours: float = 24.0
     start_hour: float = 0.0
     solar_scale: float = 1.0      # multiplies solar DER availability only
+    wind_scale: float = 1.0       # multiplies wind DER availability only
+    gas_scale: float = 1.0        # multiplies gas DER availability only (dispatchable cap)
     load_scale: float = 1.0       # global load multiplier (per-house overrides on top)
     seed: int | None = None
 
@@ -251,9 +253,14 @@ class SmartGridEnv(gym.Env):
         self._last_loads_kw = loads.astype(np.float32)
 
         avail = der_availability(self._hour, rng=self.rng)
-        # solar_scale only applies to solar DERs (so "no solar at night" stays true)
+        # Per-tech multipliers (solar_scale only applies to solar DERs so
+        # "no solar at night" stays true; same idea for wind/gas).
         solar_mask = np.array([t == "solar" for t in DER_TYPES])
+        wind_mask = np.array([t == "wind" for t in DER_TYPES])
+        gas_mask = np.array([t == "gas" for t in DER_TYPES])
         avail[solar_mask] *= self.cfg.solar_scale
+        avail[wind_mask] *= self.cfg.wind_scale
+        avail[gas_mask] *= self.cfg.gas_scale
         self._last_available_der_kw = avail.astype(np.float32)
 
     def _run_powerflow(self) -> bool:
@@ -320,8 +327,18 @@ class SmartGridEnv(gym.Env):
                 raise KeyError(f"Unknown reward weight: {k}")
             self.reward_weights[k] = float(v)
 
-    def set_scales(self, solar_scale: float | None = None, load_scale: float | None = None) -> None:
+    def set_scales(
+        self,
+        solar_scale: float | None = None,
+        load_scale: float | None = None,
+        wind_scale: float | None = None,
+        gas_scale: float | None = None,
+    ) -> None:
         if solar_scale is not None:
             self.cfg.solar_scale = float(solar_scale)
         if load_scale is not None:
             self.cfg.load_scale = float(load_scale)
+        if wind_scale is not None:
+            self.cfg.wind_scale = float(wind_scale)
+        if gas_scale is not None:
+            self.cfg.gas_scale = float(gas_scale)

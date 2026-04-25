@@ -399,6 +399,7 @@
       const [history, setHistory] = useState([]);
       const [running, setRunning] = useState(false);
       const [command, setCommand] = useState("A storm is coming and solar will drop by 70%");
+      const [lastOperator, setLastOperator] = useState(null);
       const [wsOk, setWsOk] = useState(false);
       const [err, setErr] = useState(null);
 
@@ -423,6 +424,7 @@
             }
             if (msg.type === "operator_command" && msg.payload) {
               setLog(l => [...l, msg.payload].slice(-200));
+              setLastOperator(msg.payload);
             }
           } catch (e) {}
         };
@@ -445,10 +447,13 @@
       const submitCommand = async () => {
         if (!command.trim()) return;
         try {
-          await fetchJSON("/operator_command", {
+          const result = await fetchJSON("/operator_command", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ command }),
           });
+          // Show the decision + reasoning as soon as the response arrives,
+          // even before the WS broadcast fans out.
+          if (result) setLastOperator(result);
         } catch (e) { setErr(String(e)); }
       };
 
@@ -516,6 +521,30 @@
                        placeholder="e.g. prioritize stability, we have a heatwave" />
                 <button onClick={submitCommand}>Send</button>
               </div>
+              {lastOperator && (
+                <div style={{
+                  background:"#0a0f22", border:"1px solid var(--border)",
+                  borderRadius:8, padding:"10px 12px", margin:"4px 0 10px",
+                  fontSize:12,
+                }}>
+                  <div style={{display:"flex", gap:8, alignItems:"baseline",
+                                flexWrap:"wrap", marginBottom:6}}>
+                    <span className="src op">DECISION</span>
+                    <code style={{color:"var(--ok)"}}>
+                      {Object.keys(lastOperator.applied || {}).length
+                        ? JSON.stringify(lastOperator.applied)
+                        : "(no parameter changes)"}
+                    </code>
+                  </div>
+                  {lastOperator.reasoning && (
+                    <div style={{color:"#c8d4ee", lineHeight:1.45}}>
+                      <span style={{color:"var(--muted)", fontWeight:700,
+                                    marginRight:6}}>WHY:</span>
+                      {lastOperator.reasoning}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="row-controls">
                 <button onClick={doStep}>▶ Step</button>
                 <button className="secondary" onClick={() => setRunning(r => !r)}>

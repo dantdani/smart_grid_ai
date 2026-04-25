@@ -283,6 +283,7 @@ async def post_operator_command(cmd: OperatorCommand) -> dict[str, Any]:
         "command": cmd.command,
         "parsed": parsed,
         "applied": applied,
+        "reasoning": parsed.get("reasoning", ""),
     }
     state.action_log.append(entry)
     await _broadcast({"type": "operator_command", "payload": entry,

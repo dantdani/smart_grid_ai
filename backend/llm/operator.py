@@ -29,34 +29,51 @@ SCHEMA_KEYS = {
     "curtailment_weight",
     "stability_bonus",
     "note",
+    "reasoning",
 }
 
 
 _SYSTEM_PROMPT = """You translate grid-operator natural-language commands into JSON.
 
-Return ONLY a JSON object with a subset of these keys (omit keys that the
-command does not mention):
+You MUST return a single JSON object with TWO top-level fields:
 
-- solar_scale            (float 0..2): multiplier on available solar PV.
-                         "solar drops 70%" -> 0.3; "solar doubles" -> 2.0.
-- load_scale             (float 0..2): multiplier on residential load.
-- voltage_penalty_weight (float, typical 0.5..5): higher = prioritize voltage safety.
-- curtailment_weight     (float, typical 0.01..1): higher = preserve more PV.
-- stability_bonus        (float, typical 1..20): reward when all voltages are safe.
-- note                   (string): brief echo of the operator intent.
+1. "decision": an object containing a subset of these keys (omit keys that the
+   command does not mention):
+     - solar_scale            (float 0..2): multiplier on available solar PV.
+                              "solar drops 70%" -> 0.3; "solar doubles" -> 2.0.
+     - load_scale             (float 0..2): multiplier on residential load.
+     - voltage_penalty_weight (float, typical 0.5..5): higher = prioritize voltage safety.
+     - curtailment_weight     (float, typical 0.01..1): higher = preserve more PV.
+     - stability_bonus        (float, typical 1..20): reward when all voltages are safe.
+     - note                   (string): brief echo of the operator intent.
+
+2. "reasoning": a short 1-3 sentence string explaining WHY you chose those
+   values. Reference the operator's intent, the physical effect on the grid
+   (10 houses, 5 DERs: 3 solar + 1 wind + 1 gas, voltage band 0.95-1.05 pu),
+   and any trade-offs made.
+
+ALWAYS produce the "decision" object first. The reasoning is for the human
+operator to review; it must NOT change the decision values.
 
 Examples:
-"A storm is coming and solar generation will drop by 70 percent."
- -> {"solar_scale": 0.3, "note": "Storm: solar reduced by 70%."}
 
-"Prioritize grid stability over renewable energy output."
- -> {"voltage_penalty_weight": 2.0, "curtailment_weight": 0.05,
-     "note": "Stability prioritized over renewables."}
+Input: "A storm is coming and solar generation will drop by 70 percent."
+Output:
+{"decision": {"solar_scale": 0.3, "note": "Storm: solar reduced by 70%."},
+ "reasoning": "The storm cuts incoming irradiance, so solar_scale=0.3 reflects a 70% drop in PV availability. Wind/gas DERs and reward weights are left untouched because the operator only described a solar event."}
 
-"Heatwave — households will use 50% more power."
- -> {"load_scale": 1.5, "note": "Heatwave: +50% load."}
+Input: "Prioritize grid stability over renewable energy output."
+Output:
+{"decision": {"voltage_penalty_weight": 2.0, "curtailment_weight": 0.05,
+              "note": "Stability prioritized over renewables."},
+ "reasoning": "Doubling voltage_penalty_weight to 2.0 makes the RL agent more aggressive about keeping voltages inside 0.95-1.05 pu, while shrinking curtailment_weight to 0.05 makes it cheap to curtail solar/wind when needed for stability."}
 
-Output JSON only, no prose."""
+Input: "Heatwave - households will use 50% more power."
+Output:
+{"decision": {"load_scale": 1.5, "note": "Heatwave: +50% load."},
+ "reasoning": "A 50% load surge across 10 houses risks under-voltage at the feeder tail; load_scale=1.5 simulates this so the RL/OPF stack can react. Reward weights are kept at defaults so the agent's normal trade-offs apply."}
+
+Output JSON only, no prose, no code fences."""
 
 
 def _regex_fallback(command: str) -> dict[str, Any]:
@@ -104,29 +121,53 @@ def _regex_fallback(command: str) -> dict[str, Any]:
 
 
 def parse_operator_command(command: str) -> dict[str, Any]:
-    """Parse a natural-language command. Uses OpenAI if configured, else regex."""
+    """Parse a natural-language command. Uses OpenAI if configured, else regex.
+
+    Returns a flat dict containing any of the SCHEMA_KEYS plus an optional
+    "reasoning" string explaining why those values were chosen. The decision
+    fields are extracted first and validated independently of the reasoning,
+    so a malformed reasoning never corrupts the applied parameters.
+    """
     api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         try:
             from openai import OpenAI
             client = OpenAI(api_key=api_key)
-            resp = client.chat.completions.create(
-                model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                messages=[
+            model = os.environ.get("OPENAI_MODEL", "gpt-5")
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "response_format": {"type": "json_object"},
+                "messages": [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": command},
                 ],
-            )
+            }
+            # GPT-5 / o-series reject custom temperature; only set it for older
+            # chat models that accept it.
+            if not (model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")):
+                kwargs["temperature"] = 0.0
+            resp = client.chat.completions.create(**kwargs)
             raw = resp.choices[0].message.content or "{}"
             parsed = json.loads(raw)
+
+            # Accept either {"decision": {...}, "reasoning": "..."} (preferred)
+            # or a flat dict for backward compatibility.
+            if isinstance(parsed, dict) and isinstance(parsed.get("decision"), dict):
+                decision = _clean(parsed["decision"])
+                reasoning = parsed.get("reasoning")
+                if reasoning:
+                    decision["reasoning"] = str(reasoning)
+                return decision
             return _clean(parsed)
         except Exception as e:  # noqa: BLE001
             fallback = _regex_fallback(command)
-            fallback["note"] = f"(LLM error: {e}) " + fallback.get("note", "")
+            fallback["reasoning"] = (
+                f"(LLM error: {e}) Fell back to offline regex parser."
+            )
             return fallback
-    return _regex_fallback(command)
+    out = _regex_fallback(command)
+    out.setdefault("reasoning", "Offline regex parser (no OPENAI_API_KEY set).")
+    return out
 
 
 def _clean(parsed: dict[str, Any]) -> dict[str, Any]:
@@ -134,7 +175,7 @@ def _clean(parsed: dict[str, Any]) -> dict[str, Any]:
     for k, v in parsed.items():
         if k not in SCHEMA_KEYS:
             continue
-        if k == "note":
+        if k in ("note", "reasoning"):
             out[k] = str(v)
         else:
             try:

@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from ..grid import DER_HOUSES, DER_TYPES, DER_CAPACITY_KW, NUM_DER, NUM_HOUSES
 from ..llm import parse_operator_command, predict_event, apply_to_env
 from ..rl.env import EnvConfig, SmartGridEnv, V_MAX, V_MIN
+from ..rl.self_correcting import SelfCorrectingTrainer
 from ..safety import verify_action
 
 
@@ -78,6 +79,20 @@ class AppState:
         self.agent = _AgentWrapper()
         self.action_log: Deque[dict[str, Any]] = deque(maxlen=500)
         self.websockets: list[WebSocket] = []
+
+        # Self-correcting RL trainer: persists OPF corrections to disk and
+        # runs periodic supervised fine-tuning of the PPO policy.
+        memory_path = os.environ.get(
+            "SMARTGRID_CORRECTIONS",
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                         "models", "opf_corrections.jsonl"),
+        )
+        self.trainer = SelfCorrectingTrainer(
+            capacity=int(os.environ.get("SMARTGRID_CORRECTION_CAPACITY", "10000")),
+            memory_path=memory_path,
+            retrain_every_steps=int(os.environ.get("SMARTGRID_RETRAIN_EVERY", "1000")),
+            retrain_min_new=int(os.environ.get("SMARTGRID_RETRAIN_MIN_NEW", "500")),
+        )
 
 
 state = AppState()
@@ -184,6 +199,10 @@ def get_grid_state() -> dict[str, Any]:
 async def post_step() -> StepResponse:
     env = state.env
 
+    # Snapshot the observation BEFORE we step so the correction record
+    # reflects the state the RL agent actually saw.
+    pre_obs = np.asarray(state.obs, dtype=np.float32).copy()
+
     # 1. RL proposes
     rl_action = state.agent.predict(state.obs)
 
@@ -196,6 +215,28 @@ async def post_step() -> StepResponse:
     if term or trunc:
         state.obs, _ = env.reset()
 
+    # 3b. Self-correcting RL: record the correction (if any) and possibly
+    #     trigger a behaviour-cloning fine-tune of the PPO policy.
+    correction_log = state.trainer.record_step(
+        obs=pre_obs,
+        rl_action=rl_action,
+        applied_action=applied,
+        source=verdict.source,
+        rl_violated=bool(verdict.rl_violated),
+        info_violated=bool(info["violated"]),
+        timestep=int(info["step"]),
+        voltages=info["voltages_pu"],
+    )
+    retrain_info: dict[str, Any] | None = None
+    if correction_log is not None:
+        state.action_log.append({"kind": "rl_correction", **correction_log})
+        await _broadcast({"type": "rl_correction", "payload": correction_log})
+    if state.trainer.should_retrain() and state.agent._model is not None:
+        retrain_info = state.trainer.retrain(state.agent._model)
+        retrain_info["event"] = "rl_retrain"
+        state.action_log.append({"kind": "rl_retrain", **retrain_info})
+        await _broadcast({"type": "rl_retrain", "payload": retrain_info})
+
     # 4. Log + broadcast
     entry = {
         "kind": "step",
@@ -207,6 +248,7 @@ async def post_step() -> StepResponse:
         "available_solar_kw": [float(x) for x in info["available_solar_kw"]],
         "curtailed_kw": [float(x) for x in np.asarray(info.get("curtailed_kw", []), dtype=float).reshape(-1)],
         "voltages_pu": [float(x) for x in info["voltages_pu"]],
+        "trainer": state.trainer.status(),
     }
     state.action_log.append(entry)
     await _broadcast({"type": "step", "payload": entry,
@@ -279,6 +321,37 @@ async def post_predict_event(body: EventDescription) -> dict[str, Any]:
 def get_action_log(limit: int = 100) -> dict[str, Any]:
     items = list(state.action_log)[-limit:]
     return {"count": len(items), "items": items}
+
+
+# ---------------------------------------------------------------- #
+# Self-correcting RL endpoints
+# ---------------------------------------------------------------- #
+@app.get("/learning/metrics")
+def get_learning_metrics() -> dict[str, Any]:
+    return state.trainer.status()
+
+
+@app.get("/learning/corrections")
+def get_learning_corrections(limit: int = 20) -> dict[str, Any]:
+    items = state.trainer.memory.recent(int(limit))
+    return {"count": len(items), "items": items}
+
+
+@app.post("/learning/retrain")
+async def post_learning_retrain() -> dict[str, Any]:
+    if state.agent._model is None:
+        return {"status": "skipped", "reason": "no PPO model loaded"}
+    info = state.trainer.retrain(state.agent._model)
+    info["event"] = "rl_retrain"
+    state.action_log.append({"kind": "rl_retrain", **info})
+    await _broadcast({"type": "rl_retrain", "payload": info})
+    return info
+
+
+@app.post("/learning/clear")
+def post_learning_clear() -> dict[str, Any]:
+    state.trainer.memory.clear()
+    return {"status": "ok", "buffer_size": len(state.trainer.memory)}
 
 
 @app.post("/reset")

@@ -27,3 +27,6 @@ train_log.txt
 # Editor
 .vscode/
 .idea/
+
+# Self-correcting RL artifacts
+models/opf_corrections.jsonl

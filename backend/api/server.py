@@ -155,7 +155,10 @@ class HouseLoadScales(BaseModel):
 
 class DerOverride(BaseModel):
     der_index: int
-    curtailment: float | None = None  # None clears override
+    # Pin the DER to this delivered power in kW (clamped to nameplate). None clears the pin.
+    power_kw: float | None = None
+    # Backward-compat: old clients sent `curtailment` in [0,1]; treat as fraction of capacity.
+    curtailment: float | None = None
 
 
 class StepResponse(BaseModel):
@@ -286,7 +289,17 @@ async def post_set_house_loads(body: HouseLoadScales) -> dict[str, Any]:
 
 @app.post("/set_der_override")
 async def post_set_der_override(body: DerOverride) -> dict[str, Any]:
-    state.env.set_der_override(body.der_index, body.curtailment)
+    from ..grid import DER_CAPACITY_KW as _CAP
+
+    if body.power_kw is not None:
+        pinned: float | None = float(body.power_kw)
+    elif body.curtailment is not None:
+        # Legacy clients (curtailment fraction in [0,1]) -> equivalent kW vs nameplate.
+        cap = float(_CAP[body.der_index])
+        pinned = max(0.0, (1.0 - float(body.curtailment)) * cap)
+    else:
+        pinned = None
+    state.env.set_der_override(body.der_index, pinned)
     overrides = [None if (x != x) else float(x) for x in state.env.manual_overrides.tolist()]
     entry = {
         "kind": "operator_command",

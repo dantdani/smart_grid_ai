@@ -51,9 +51,25 @@ class VerificationResult:
         return asdict(self)
 
 
-def _simulate(net: pp.pandapowerNet, handles, loads_kw, available_kw, curtail) -> tuple[bool, np.ndarray]:
-    """Apply (loads, solar * (1-curtail)) to *net* and run power flow. Returns (converged, house_voltages)."""
-    delivered = np.asarray(available_kw, dtype=float) * (1.0 - np.asarray(curtail, dtype=float))
+def _simulate(
+    net: pp.pandapowerNet,
+    handles,
+    loads_kw,
+    available_kw,
+    curtail,
+    overrides: np.ndarray | None = None,
+) -> tuple[bool, np.ndarray]:
+    """Apply (loads, der_dispatch) to *net* and run power flow.
+
+    Pinned DERs (finite values in `overrides`, kW) bypass availability and are
+    delivered at their pinned kW directly, matching env.step's behaviour.
+    """
+    avail = np.asarray(available_kw, dtype=float)
+    delivered = avail * (1.0 - np.asarray(curtail, dtype=float))
+    if overrides is not None:
+        m = ~np.isnan(overrides)
+        if m.any():
+            delivered[m] = np.clip(overrides[m], 0.0, _DER_CAP[m])
     set_loads_kw(handles, loads_kw)
     set_der_kw(handles, delivered.tolist())
     try:
@@ -82,8 +98,9 @@ def _run_opf(handles, loads_kw, available_kw, overrides: np.ndarray | None = Non
     all bus voltages in [V_MIN, V_MAX]. Returns per-DER curtailment in [0,1],
     or None if OPF fails.
 
-    If `overrides` is given (length NUM_DER, NaN = free, value = pinned
-    curtailment), the pinned DERs are forced via `min_p_mw == max_p_mw`.
+    If `overrides` is given (length NUM_DER, NaN = free, finite value = pinned
+    delivered power in kW), the pinned DERs are forced via
+    `min_p_mw == max_p_mw` so the OPF treats them as fixed sources.
     """
     net = handles.net
     avail = np.minimum(np.clip(np.asarray(available_kw, dtype=float), 0.0, None), _DER_CAP)
@@ -93,7 +110,7 @@ def _run_opf(handles, loads_kw, available_kw, overrides: np.ndarray | None = Non
         a = float(avail[i])
         net.sgen.at[sidx, "controllable"] = True
         if overrides is not None and not np.isnan(overrides[i]):
-            forced = a * (1.0 - float(np.clip(overrides[i], 0.0, 1.0)))
+            forced = float(np.clip(overrides[i], 0.0, _DER_CAP[i]))
             net.sgen.at[sidx, "min_p_mw"] = forced * 1e-3
             net.sgen.at[sidx, "max_p_mw"] = forced * 1e-3
             net.sgen.at[sidx, "p_mw"] = forced * 1e-3
@@ -143,18 +160,25 @@ def verify_action(
     dispatch the user will actually see.
     """
     rl_raw = np.clip(np.asarray(rl_action, dtype=float), 0.0, 1.0)
-    overrides = np.asarray(env.manual_overrides, dtype=float)
+    overrides = np.asarray(env.manual_overrides, dtype=float)  # values are kW (NaN = free)
+    available_kw = np.asarray(env._last_available_der_kw, dtype=float)
+
     rl = rl_raw.copy()
     mask = ~np.isnan(overrides)
     if mask.any():
-        rl[mask] = np.clip(overrides[mask], 0.0, 1.0)
+        # Convert pinned kW -> equivalent curtailment for the RL probe.
+        denom = np.where(available_kw[mask] > 1e-9, available_kw[mask], _DER_CAP[mask])
+        pinned_kw = np.clip(overrides[mask], 0.0, _DER_CAP[mask])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            curt = np.where(denom > 1e-9, 1.0 - pinned_kw / denom, 0.0)
+        rl[mask] = np.clip(curt, 0.0, 1.0)
 
     loads_kw = env._last_loads_kw.tolist()
-    available_kw = env._last_available_der_kw.tolist()
+    available_kw = available_kw.tolist()
 
     # 1. Probe the RL action on a cloned net
     probe = _clone_handles(env)
-    ok_rl, v_rl = _simulate(probe.net, probe, loads_kw, available_kw, rl)
+    ok_rl, v_rl = _simulate(probe.net, probe, loads_kw, available_kw, rl, overrides=overrides)
     rl_violated = _any_violation(v_rl) if ok_rl else True
 
     if ok_rl and not rl_violated:
@@ -174,12 +198,13 @@ def verify_action(
     opf_curtail = _run_opf(opf_clone, loads_kw, available_kw, overrides=overrides)
 
     if opf_curtail is not None:
-        # Force pinned DERs to their override regardless of OPF rounding
+        # Force pinned DERs to their override (converted back to curtailment
+        # so the simulation matches what env.step will deliver).
         if mask.any():
             opf_curtail = opf_curtail.copy()
-            opf_curtail[mask] = np.clip(overrides[mask], 0.0, 1.0)
+            opf_curtail[mask] = rl[mask]  # already converted to curtailment above
         check = _clone_handles(env)
-        ok_opf, v_opf = _simulate(check.net, check, loads_kw, available_kw, opf_curtail)
+        ok_opf, v_opf = _simulate(check.net, check, loads_kw, available_kw, opf_curtail, overrides=overrides)
         if ok_opf and not _any_violation(v_opf):
             return VerificationResult(
                 source="opf",
@@ -196,9 +221,9 @@ def verify_action(
     fb = np.ones(NUM_DER)
     if mask.any():
         fb = fb.copy()
-        fb[mask] = np.clip(overrides[mask], 0.0, 1.0)
+        fb[mask] = rl[mask]  # already converted from kW to curtailment above
     check = _clone_handles(env)
-    _, v_fb = _simulate(check.net, check, loads_kw, available_kw, fb)
+    _, v_fb = _simulate(check.net, check, loads_kw, available_kw, fb, overrides=overrides)
     return VerificationResult(
         source="fallback",
         applied_curtailment=fb.tolist(),

@@ -311,21 +311,31 @@
       const avail = state.available_der_kw || state.available_solar_kw || [];
       const iconMap = { solar: "☼", wind: "🌬", gas: "🔥" };
       const labelMap = { solar: "Solar", wind: "Wind", gas: "Gas" };
-      const post = (idx, curtailment) => fetchJSON("/set_der_override", {
+      // Local "drag draft" so the slider doesn't fight WebSocket grid_state updates
+      // while the operator is dragging. draft[i] === null means "use server value".
+      const [draft, setDraft] = useState(() => types.map(() => null));
+      // If DER count ever changes, resize draft.
+      useEffect(() => {
+        if (draft.length !== types.length) setDraft(types.map(() => null));
+      }, [types.length]);
+      const postKw = (idx, power_kw) => fetchJSON("/set_der_override", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ der_index: idx, curtailment }),
+        body: JSON.stringify({ der_index: idx, power_kw }),
       }).catch(() => {});
-      const clearAll = () => fetchJSON("/clear_der_overrides", { method: "POST" }).catch(() => {});
+      const clearAll = () => fetchJSON("/clear_der_overrides", { method: "POST" })
+        .then(() => setDraft(types.map(() => null))).catch(() => {});
       return (
         <div>
           <div className="row-controls">
             <button className="secondary" onClick={clearAll}>Auto-pilot all</button>
-            <span className="tiny">Pin a DER to a fixed curtailment; the RL agent optimizes the rest.</span>
+            <span className="tiny">Pin a DER to a fixed kW output; the RL agent dispatches the rest.</span>
           </div>
           <div style={{display:"flex", flexDirection:"column", gap:6}}>
             {types.map((t, i) => {
               const pinned = overrides[i] != null;
-              const cVal = pinned ? overrides[i] : 0.0;
+              const cap = caps[i] ?? 1;
+              const serverKw = pinned ? overrides[i] : 0.0;
+              const displayKw = draft[i] != null ? draft[i] : serverKw;
               return (
                 <div key={i} style={{display:"flex", alignItems:"center", gap:8, fontSize:12,
                                      background:"#0f1530", border:"1px solid #24304f",
@@ -333,17 +343,42 @@
                   <span style={{width:24, fontSize:16}}>{iconMap[t] || "?"}</span>
                   <span style={{width:56}}>{labelMap[t] || t}</span>
                   <span style={{width:32, color:"#8a97b8"}}>H{houses[i]}</span>
-                  <span style={{width:80, color:"#8a97b8"}}>{(avail[i] ?? 0).toFixed(1)} / {caps[i]} kW</span>
+                  <span style={{width:80, color:"#8a97b8"}}>{(avail[i] ?? 0).toFixed(1)} / {cap} kW</span>
                   <label style={{display:"flex", alignItems:"center", gap:4}}>
                     <input type="checkbox" checked={pinned}
-                           onChange={(e) => post(i, e.target.checked ? 0.0 : null)} />
+                           onChange={(e) => {
+                             if (e.target.checked) {
+                               // Pin at current availability (or half capacity if 0) so it actually does something.
+                               const initKw = (avail[i] && avail[i] > 0) ? avail[i] : cap * 0.5;
+                               postKw(i, initKw);
+                             } else {
+                               postKw(i, null);
+                               setDraft(d => { const n=[...d]; n[i]=null; return n; });
+                             }
+                           }} />
                     Pin
                   </label>
-                  <input type="range" min="0" max="1" step="0.01"
-                         disabled={!pinned} value={cVal} style={{flex:1, opacity: pinned?1:0.4}}
-                         onChange={(e) => post(i, parseFloat(e.target.value))}/>
-                  <span style={{width:54, textAlign:"right"}}>
-                    curt {(cVal * 100).toFixed(0)}%
+                  <input type="range" min="0" max={cap} step={Math.max(cap/100, 0.05)}
+                         disabled={!pinned} value={displayKw}
+                         style={{flex:1, opacity: pinned?1:0.4}}
+                         onChange={(e) => {
+                           const v = parseFloat(e.target.value);
+                           setDraft(d => { const n=[...d]; n[i]=v; return n; });
+                         }}
+                         onPointerUp={(e) => {
+                           if (!pinned) return;
+                           const v = parseFloat(e.target.value);
+                           postKw(i, v).then(() =>
+                             setDraft(d => { const n=[...d]; n[i]=null; return n; }));
+                         }}
+                         onMouseUp={(e) => {
+                           if (!pinned) return;
+                           const v = parseFloat(e.target.value);
+                           postKw(i, v).then(() =>
+                             setDraft(d => { const n=[...d]; n[i]=null; return n; }));
+                         }}/>
+                  <span style={{width:72, textAlign:"right"}}>
+                    {displayKw.toFixed(2)} kW
                   </span>
                 </div>
               );

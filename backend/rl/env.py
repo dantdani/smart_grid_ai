@@ -107,7 +107,9 @@ class SmartGridEnv(gym.Env):
 
         # Per-house multiplier (defaults to 1.0 each). Operator slider sets these.
         self.house_load_scales: np.ndarray = np.ones(NUM_HOUSES, dtype=np.float32)
-        # NaN means "RL controls it"; finite value in [0,1] pins the DER's curtailment.
+        # NaN means "RL controls it"; finite value pins delivered power in kW for that DER.
+        # Pinned DERs bypass availability (so an operator can demand fixed gas/wind output
+        # even at night, or hold solar to a fixed kW even when availability would be higher).
         self.manual_overrides: np.ndarray = np.full(NUM_DER, np.nan, dtype=np.float32)
 
     # Backward-compat alias (older code may still read this attribute name)
@@ -140,10 +142,33 @@ class SmartGridEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         action = np.asarray(action, dtype=np.float32).reshape(NUM_DER)
         action = np.clip(action, 0.0, 1.0)
-        action = self.apply_overrides(action)
 
-        curtailed_kw = self._last_available_der_kw * action
-        delivered_kw = self._last_available_der_kw - curtailed_kw
+        # Start with RL-derived dispatch from availability + curtailment.
+        delivered_kw = self._last_available_der_kw * (1.0 - action)
+
+        # Pinned DERs override delivered power outright (bypass availability + RL).
+        caps = np.asarray(DER_CAPACITY_KW, dtype=np.float32)
+        mask = ~np.isnan(self.manual_overrides)
+        if mask.any():
+            pinned_kw = np.clip(self.manual_overrides[mask], 0.0, caps[mask])
+            delivered_kw[mask] = pinned_kw
+
+        # Recompute action so logs/observations reflect what was actually applied.
+        # For pinned DERs we synthesize an effective curtailment fraction relative to
+        # the nameplate capacity (so the action vector still sits in [0,1]).
+        with np.errstate(divide="ignore", invalid="ignore"):
+            applied_action = np.where(
+                self._last_available_der_kw > 1e-9,
+                1.0 - delivered_kw / self._last_available_der_kw,
+                np.where(caps > 1e-9, 1.0 - delivered_kw / caps, 0.0),
+            )
+        applied_action = np.clip(applied_action, 0.0, 1.0).astype(np.float32)
+
+        # "Curtailed" power for the reward is what we *could* have produced minus what we did.
+        # For a pinned DER that exceeds availability (e.g. gas at night), curtailed = 0.
+        effective_avail = np.maximum(self._last_available_der_kw, delivered_kw)
+        curtailed_kw = np.maximum(effective_avail - delivered_kw, 0.0)
+
         set_loads_kw(self.handles, self._last_loads_kw.tolist())
         set_der_kw(self.handles, delivered_kw.tolist())
 
@@ -158,7 +183,7 @@ class SmartGridEnv(gym.Env):
         self._sample_exogenous()
         obs = self._build_observation()
         info = self._build_info(
-            curtail=action,
+            curtail=applied_action,
             curtailed_kw=curtailed_kw,
             delivered_kw=delivered_kw,
             violated=violated,
@@ -170,11 +195,24 @@ class SmartGridEnv(gym.Env):
     # Overrides / scales
     # ------------------------------------------------------------------
     def apply_overrides(self, action: np.ndarray) -> np.ndarray:
-        """Return action with manual overrides substituted for the locked DERs."""
+        """Substitute pinned DERs' equivalent curtailment into the RL action.
+
+        Used by the safety verifier so its RL-probe simulation reflects what
+        will actually be dispatched. Pinned DERs are converted from kW to a
+        curtailment fraction relative to current availability (or nameplate
+        when availability is zero, which is the case e.g. for gas at night).
+        """
         out = np.asarray(action, dtype=np.float32).copy()
         mask = ~np.isnan(self.manual_overrides)
-        if mask.any():
-            out[mask] = np.clip(self.manual_overrides[mask], 0.0, 1.0)
+        if not mask.any():
+            return out
+        caps = np.asarray(DER_CAPACITY_KW, dtype=np.float32)
+        avail = self._last_available_der_kw
+        pinned_kw = np.clip(self.manual_overrides[mask], 0.0, caps[mask])
+        denom = np.where(avail[mask] > 1e-9, avail[mask], caps[mask])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            curt = np.where(denom > 1e-9, 1.0 - pinned_kw / denom, 0.0)
+        out[mask] = np.clip(curt, 0.0, 1.0)
         return out
 
     def set_house_load_scale(self, house_id: int, scale: float) -> None:
@@ -188,13 +226,15 @@ class SmartGridEnv(gym.Env):
             raise ValueError(f"Expected {NUM_HOUSES} scales, got {arr.size}")
         self.house_load_scales = np.clip(arr, 0.0, 5.0)
 
-    def set_der_override(self, der_index: int, curtailment: float | None) -> None:
+    def set_der_override(self, der_index: int, power_kw: float | None) -> None:
+        """Pin a DER to a fixed delivered power in kW (None clears the pin)."""
         if not (0 <= der_index < NUM_DER):
             raise ValueError(f"der_index must be 0..{NUM_DER - 1}, got {der_index}")
-        if curtailment is None:
+        if power_kw is None:
             self.manual_overrides[der_index] = np.nan
         else:
-            self.manual_overrides[der_index] = float(np.clip(curtailment, 0.0, 1.0))
+            cap = float(DER_CAPACITY_KW[der_index])
+            self.manual_overrides[der_index] = float(np.clip(power_kw, 0.0, cap))
 
     def clear_der_overrides(self) -> None:
         self.manual_overrides[:] = np.nan
